@@ -7,7 +7,7 @@ personal Ip-Adapter finetune for NoobAI-XL, which is trained with guide images o
 
 It re-uses the official clip vision models downloaded from ip adapters' huggingface repo and simply interpolates the positional embedding. So if you already have it locally, there should be no model downloading.
 
-[Here]() is the ComfyUI counterpart of this extension.
+[Here](https://github.com/vahlok-alunmid/ComfyUI-ExtendIPAdapterClipVision) is the ComfyUI counterpart of this extension.
 
 ## How To Install
 
