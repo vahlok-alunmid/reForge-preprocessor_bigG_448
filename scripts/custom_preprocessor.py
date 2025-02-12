@@ -1,10 +1,15 @@
+import json
 import logging
 import math
 import os
 
 import torch
 
-from ldm_patched.modules.clip_vision import convert_to_transformers, ClipVisionModel
+import ldm_patched.modules.ops
+import ldm_patched.modules.model_patcher
+import ldm_patched.modules.model_management
+import ldm_patched.modules.clip_model
+from ldm_patched.modules.clip_vision import convert_to_transformers, clip_preprocess, Output
 from ldm_patched.modules.utils import load_torch_file
 from modules.util import load_file_from_url
 from modules_forge.forge_util import numpy_to_pytorch
@@ -80,6 +85,38 @@ def interpolate_embeddings(
         new_pos_embedding = pos_embedding
 
     return new_pos_embedding
+
+
+class ClipVisionModel:
+    def __init__(self, json_config):
+        with open(json_config) as f:
+            config = json.load(f)
+
+        self.image_size = config.get("image_size", 224)
+        self.load_device = ldm_patched.modules.model_management.text_encoder_device()
+        offload_device = ldm_patched.modules.model_management.text_encoder_offload_device()
+        self.dtype = ldm_patched.modules.model_management.text_encoder_dtype(self.load_device)
+        self.model = ldm_patched.modules.clip_model.CLIPVisionModelProjection(config, self.dtype, offload_device, ldm_patched.modules.ops.manual_cast)
+        self.model.eval()
+
+        self.patcher = ldm_patched.modules.model_patcher.ModelPatcher(self.model, load_device=self.load_device, offload_device=offload_device)
+
+    def load_sd(self, sd):
+        return self.model.load_state_dict(sd, strict=False)
+
+    def get_sd(self):
+        return self.model.state_dict()
+
+    def encode_image(self, image):
+        ldm_patched.modules.model_management.load_model_gpu(self.patcher)
+        pixel_values = clip_preprocess(image.to(self.load_device), size=self.image_size).float()
+        out = self.model(pixel_values=pixel_values, intermediate_output=-2)
+
+        outputs = Output()
+        outputs["last_hidden_state"] = out[0].to(ldm_patched.modules.model_management.intermediate_device())
+        outputs["image_embeds"] = out[2].to(ldm_patched.modules.model_management.intermediate_device())
+        outputs["penultimate_hidden_states"] = out[1].to(ldm_patched.modules.model_management.intermediate_device())
+        return outputs
 
 
 def load_448_clipvision_from_sd(sd, prefix="", convert_keys=False):
