@@ -73,14 +73,6 @@ def is_clip_preprocess_line(node):
     return 'clip_preprocess' in ast.unparse(node)
 
 
-if BACKEND == 'forge':
-    patch_method(ClipVisionModel, 'encode_image', is_clip_preprocess_line,
-                 'pixel_values = clip_preprocess(image.to(self.load_device), size=self.image_size if hasattr(self, "image_size") else 224)')
-else:
-    patch_method(ClipVisionModel, 'encode_image', is_clip_preprocess_line,
-                 'pixel_values = clip_preprocess(image.to(self.load_device), size=self.image_size if hasattr(self, "image_size") else 224).float()')
-
-
 class SizeAwareClipVisionModel(ClipVisionModel):
     def __init__(self, config_path: str):
         with open(config_path) as f:
@@ -90,6 +82,14 @@ class SizeAwareClipVisionModel(ClipVisionModel):
         else:
             super().__init__(config_path)
         self.image_size = config.get("image_size", 224)
+
+
+if BACKEND == 'forge':
+    patch_method(SizeAwareClipVisionModel, 'encode_image', is_clip_preprocess_line,
+                 'pixel_values = clip_preprocess(image.to(self.load_device), size=self.image_size if hasattr(self, "image_size") else 224)')
+else:
+    patch_method(SizeAwareClipVisionModel, 'encode_image', is_clip_preprocess_line,
+                 'pixel_values = clip_preprocess(image.to(self.load_device), size=self.image_size if hasattr(self, "image_size") else 224).float()')
 
 
 def interpolate_embeddings(
