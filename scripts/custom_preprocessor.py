@@ -2,19 +2,94 @@ import json
 import logging
 import math
 import os
+import ast
+import copy
+import inspect
+import textwrap
 
 import torch
 
-import ldm_patched.modules.ops
-import ldm_patched.modules.model_patcher
-import ldm_patched.modules.model_management
-import ldm_patched.modules.clip_model
-from ldm_patched.modules.clip_vision import convert_to_transformers, clip_preprocess, Output
-from ldm_patched.modules.utils import load_torch_file
-from modules.util import load_file_from_url
-from modules_forge.forge_util import numpy_to_pytorch
+try:
+    from ldm_patched.modules.clip_vision import ClipVisionModel, convert_to_transformers
+    from ldm_patched.modules.utils import load_torch_file
+    from modules.util import load_file_from_url
+    from modules_forge.forge_util import numpy_to_pytorch
+    BACKEND = 'reforge'
+    logging.info('CLIP V Extending Extension: ReForge Backend Detected')
+except ImportError:
+    from backend.patcher.clipvision import ClipVisionModel, convert_to_transformers
+    from backend.utils import load_torch_file
+    from modules.modelloader import load_file_from_url
+    from modules_forge.utils import numpy_to_pytorch
+    BACKEND = 'forge'
+    print('CLIP V Extending Extension: Forge Backend Detected')
 from modules_forge.supported_preprocessor import PreprocessorClipVision
 from modules_forge.shared import add_supported_preprocessor, preprocessor_dir
+
+
+def patch_method(cls, method_name, line_predicate, new_code):
+    original_method = getattr(cls, method_name)
+
+    source = inspect.getsource(original_method)
+    dedented_source = textwrap.dedent(source)
+
+    # make a temporary wrapper
+    wrapped_source = (
+        f"def __temp_wrapper__():\n"
+        f"{textwrap.indent(dedented_source, '    ')}\n"
+        f"    return {method_name}"
+    )
+    tree = ast.parse(wrapped_source)
+
+    class Transformer(ast.NodeTransformer):
+        def visit_FunctionDef(self, node):  # modify the wrapped function's target line
+            for i, stmt in enumerate(node.body):
+                if isinstance(stmt, ast.FunctionDef) and stmt.name == method_name:
+                    for j, stmt_ in enumerate(stmt.body):
+                        if line_predicate(stmt_):
+                            new_node = ast.parse(new_code).body[0]
+                            stmt.body[j] = new_node
+                            break
+                    break
+            return node
+
+    # apply change to function
+    transformer = Transformer()
+    new_tree = transformer.visit(tree)
+    ast.fix_missing_locations(new_tree)
+
+    # compel
+    code_obj = compile(new_tree, "<ast>", "exec")
+    exec_globals = original_method.__globals__.copy()
+    exec(code_obj, exec_globals)
+    wrapper_func = exec_globals["__temp_wrapper__"]
+    new_method = wrapper_func()  # get modified function from wrapper
+
+    # assign function as method
+    setattr(cls, method_name, new_method)
+
+
+def is_clip_preprocess_line(node):
+    return 'clip_preprocess' in ast.unparse(node)
+
+
+if BACKEND == 'forge':
+    patch_method(ClipVisionModel, 'encode_image', is_clip_preprocess_line,
+                 'pixel_values = clip_preprocess(image.to(self.load_device), size=self.image_size if hasattr(self, "image_size") else 224)')
+else:
+    patch_method(ClipVisionModel, 'encode_image', is_clip_preprocess_line,
+                 'pixel_values = clip_preprocess(image.to(self.load_device), size=self.image_size if hasattr(self, "image_size") else 224).float()')
+
+
+class SizeAwareClipVisionModel(ClipVisionModel):
+    def __init__(self, config_path: str):
+        with open(config_path) as f:
+            config = json.load(f)
+        if BACKEND == 'forge':
+            super().__init__(config)
+        else:
+            super().__init__(config_path)
+        self.image_size = config.get("image_size", 224)
 
 
 def interpolate_embeddings(
@@ -87,38 +162,6 @@ def interpolate_embeddings(
     return new_pos_embedding
 
 
-class ClipVisionModel:
-    def __init__(self, json_config):
-        with open(json_config) as f:
-            config = json.load(f)
-
-        self.image_size = config.get("image_size", 224)
-        self.load_device = ldm_patched.modules.model_management.text_encoder_device()
-        offload_device = ldm_patched.modules.model_management.text_encoder_offload_device()
-        self.dtype = ldm_patched.modules.model_management.text_encoder_dtype(self.load_device)
-        self.model = ldm_patched.modules.clip_model.CLIPVisionModelProjection(config, self.dtype, offload_device, ldm_patched.modules.ops.manual_cast)
-        self.model.eval()
-
-        self.patcher = ldm_patched.modules.model_patcher.ModelPatcher(self.model, load_device=self.load_device, offload_device=offload_device)
-
-    def load_sd(self, sd):
-        return self.model.load_state_dict(sd, strict=False)
-
-    def get_sd(self):
-        return self.model.state_dict()
-
-    def encode_image(self, image):
-        ldm_patched.modules.model_management.load_model_gpu(self.patcher)
-        pixel_values = clip_preprocess(image.to(self.load_device), size=self.image_size).float()
-        out = self.model(pixel_values=pixel_values, intermediate_output=-2)
-
-        outputs = Output()
-        outputs["last_hidden_state"] = out[0].to(ldm_patched.modules.model_management.intermediate_device())
-        outputs["image_embeds"] = out[2].to(ldm_patched.modules.model_management.intermediate_device())
-        outputs["penultimate_hidden_states"] = out[1].to(ldm_patched.modules.model_management.intermediate_device())
-        return outputs
-
-
 def load_448_clipvision_from_sd(sd, prefix="", convert_keys=False):
     if convert_keys:
         sd = convert_to_transformers(sd, prefix)
@@ -134,10 +177,13 @@ def load_448_clipvision_from_sd(sd, prefix="", convert_keys=False):
     else:
         return None
 
-    clip = ClipVisionModel(json_config)
+    clip = SizeAwareClipVisionModel(json_config)
     m, u = clip.load_sd(sd)
     if len(m) > 0:
-        logging.warning("missing clip vision: {}".format(m))
+        if BACKEND == 'reforge':
+            logging.warning("missing clip vision: {}".format(m))
+        else:
+            print("extra clip vision:", m)
     u = set(u)
     keys = list(sd.keys())
     for k in keys:
@@ -199,8 +245,9 @@ class CustomPreprocessorClipVisionForIPAdapter(PreprocessorClipVision):
                 self.clipvision = load_448_clipvision_from_sd(sd)
             PreprocessorClipVision.global_cache[ckpt_hash] = self.clipvision
 
-        # Set up the model patcher for the CLIP vision model
-        self.setup_model_patcher(self.clipvision.model)
+        if BACKEND == 'reforge':
+            # Set up the model patcher for the CLIP vision model
+            self.setup_model_patcher(self.clipvision.model)
 
         return self.clipvision
 
