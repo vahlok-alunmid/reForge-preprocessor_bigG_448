@@ -8,6 +8,7 @@ import inspect
 import textwrap
 
 import torch
+from transformers.models.clip.modeling_clip import CLIPVisionEmbeddings
 
 try:
     from ldm_patched.modules.clip_vision import ClipVisionModel, convert_to_transformers
@@ -27,7 +28,7 @@ from modules_forge.supported_preprocessor import PreprocessorClipVision
 from modules_forge.shared import add_supported_preprocessor, preprocessor_dir
 
 
-def patch_method(cls, method_name, line_predicate, new_code):
+def patch_method(cls, method_name, line_predicates, new_codes):
     original_method = getattr(cls, method_name)
 
     source = inspect.getsource(original_method)
@@ -46,11 +47,10 @@ def patch_method(cls, method_name, line_predicate, new_code):
             for i, stmt in enumerate(node.body):
                 if isinstance(stmt, ast.FunctionDef) and stmt.name == method_name:
                     for j, stmt_ in enumerate(stmt.body):
-                        if line_predicate(stmt_):
-                            new_node = ast.parse(new_code).body[0]
-                            stmt.body[j] = new_node
-                            break
-                    break
+                        for line_predicate, new_code in zip(line_predicates, new_codes):
+                            if line_predicate(stmt_):
+                                new_node = ast.parse(new_code).body[0]
+                                stmt.body[j] = new_node
             return node
 
     # apply change to function
@@ -73,6 +73,14 @@ def is_clip_preprocess_line(node):
     return 'clip_preprocess' in ast.unparse(node)
 
 
+def is_embed_line(node):
+    return 'torch.cat([class_embeds' in ast.unparse(node)
+
+
+def is_position_id_line(node):
+    return 'self.position_embedding(self.position_ids)' in ast.unparse(node)
+
+
 class SizeAwareClipVisionModel(ClipVisionModel):
     def __init__(self, config_path: str):
         with open(config_path) as f:
@@ -84,12 +92,16 @@ class SizeAwareClipVisionModel(ClipVisionModel):
         self.image_size = config.get("image_size", 224)
 
 
-if BACKEND == 'forge':
-    patch_method(SizeAwareClipVisionModel, 'encode_image', is_clip_preprocess_line,
-                 'pixel_values = clip_preprocess(image.to(self.model.vision_model.embeddings.patch_embedding.weight.device), size=self.image_size if hasattr(self, "image_size") else 224)')
+if BACKEND == 'reforge':
+    patch_method(SizeAwareClipVisionModel, 'encode_image', [is_clip_preprocess_line],
+                 ['pixel_values = clip_preprocess(image.to(self.model.vision_model.embeddings.patch_embedding.weight.device), size=self.image_size if hasattr(self, "image_size") else 224).float()'])
 else:
-    patch_method(SizeAwareClipVisionModel, 'encode_image', is_clip_preprocess_line,
-                 'pixel_values = clip_preprocess(image.to(self.model.vision_model.embeddings.patch_embedding.weight.device), size=self.image_size if hasattr(self, "image_size") else 224).float()')
+    patch_method(SizeAwareClipVisionModel, 'encode_image', [is_clip_preprocess_line],
+                 ['pixel_values = clip_preprocess(image.to(self.model.vision_model.embeddings.patch_embedding.weight.device), size=self.image_size if hasattr(self, "image_size") else 224)'])
+patch_method(CLIPVisionEmbeddings, 'forward', [is_embed_line, is_position_id_line],
+             ['embeddings = torch.cat([class_embeds.to(patch_embeds.device), patch_embeds], dim=1)',
+              'embeddings = embeddings + self.position_embedding(self.position_ids.to(self.position_embedding.weight.device)).to(embeddings.device)']
+             )
 
 
 def interpolate_embeddings(
