@@ -86,10 +86,10 @@ class SizeAwareClipVisionModel(ClipVisionModel):
 
 if BACKEND == 'forge':
     patch_method(SizeAwareClipVisionModel, 'encode_image', is_clip_preprocess_line,
-                 'pixel_values = clip_preprocess(image.to(self.load_device), size=self.image_size if hasattr(self, "image_size") else 224)')
+                 'pixel_values = clip_preprocess(image.to(self.model.vision_model.embeddings.patch_embedding.weight.device), size=self.image_size if hasattr(self, "image_size") else 224)')
 else:
     patch_method(SizeAwareClipVisionModel, 'encode_image', is_clip_preprocess_line,
-                 'pixel_values = clip_preprocess(image.to(self.load_device), size=self.image_size if hasattr(self, "image_size") else 224).float()')
+                 'pixel_values = clip_preprocess(image.to(self.model.vision_model.embeddings.patch_embedding.weight.device), size=self.image_size if hasattr(self, "image_size") else 224).float()')
 
 
 def interpolate_embeddings(
